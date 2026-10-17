@@ -1,28 +1,23 @@
 """
-MolPredict — Molecular Property Prediction with Deep Learning
-=============================================================
-A modular, production-ready ML pipeline for predicting molecular properties
-from SMILES strings using Morgan fingerprints and deep neural networks.
+MolPredict — molecular property (LogP) prediction from SMILES.
 
-Author : Prajwal Khadka (@prajwalkkhadka-cpu)
-License: MIT
+Pipeline: SMILES -> RDKit features (Morgan fingerprint + descriptors) -> MLP.
 """
 
-__version__ = "1.0.0"
-__author__  = "Prajwal Khadka"
+__version__ = "1.1.0"
 
 from molpredict.data.preprocessing import DataPreprocessor
-from molpredict.features.engineering import FeatureEngineer
-from molpredict.models.mlp import MolecularMLP
-from molpredict.models.gnn import MolecularGNN
-from molpredict.training.trainer import Trainer
 from molpredict.evaluation.metrics import MolecularMetrics
+from molpredict.features.engineering import FeatureEngineer
+from molpredict.inference import Predictor
+from molpredict.models.mlp import MolecularMLP
+from molpredict.training.trainer import Trainer
 
 __all__ = [
     "DataPreprocessor",
     "FeatureEngineer",
     "MolecularMLP",
-    "MolecularGNN",
-    "Trainer",
     "MolecularMetrics",
+    "Predictor",
+    "Trainer",
 ]

@@ -1,46 +1,57 @@
 """
-Data Preprocessing Module
-=========================
-Handles loading, validation, cleaning, and splitting of molecular datasets.
+Data preprocessing: load -> clean -> split -> normalise targets.
 
-Key responsibilities:
-  - Load CSV data with SMILES strings and target properties
-  - Validate SMILES strings using RDKit
-  - Remove duplicate and invalid molecules
-  - Stratified train/validation/test splitting
-  - Target property normalization (StandardScaler)
+Splitting defaults to a *scaffold* split (molecules sharing a Bemis-Murcko
+scaffold stay in the same subset), which is the standard honest protocol for
+molecular property prediction. A plain random split is available too.
 """
 
+from __future__ import annotations
+
 import logging
+from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import Descriptors
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
+# Typographic minus signs that pandas would otherwise turn into NaN.
+_MINUS_CHARS = ("\u2212", "\u2013", "\u2014", "\u2012")
+
+
+def _to_numeric(series: pd.Series) -> pd.Series:
+    """Convert to float, accepting unicode minus/dash characters."""
+    if not pd.api.types.is_numeric_dtype(series):  # object OR pandas StringDtype
+        series = series.astype(str).str.strip()
+        for ch in _MINUS_CHARS:
+            series = series.str.replace(ch, "-", regex=False)
+    return pd.to_numeric(series, errors="coerce")
+
+
+def murcko_scaffold(smiles: str) -> str:
+    """Bemis-Murcko scaffold SMILES ('' for acyclic molecules)."""
+    try:
+        return MurckoScaffold.MurckoScaffoldSmiles(smiles=smiles, includeChirality=False)
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
 
 class DataPreprocessor:
     """
-    End-to-end data preprocessing pipeline for molecular datasets.
-
     Parameters
     ----------
-    smiles_col : str
-        Column name containing SMILES strings.
-    target_col : str
-        Column name containing the target property to predict.
-    test_size : float
-        Fraction of data reserved for the test set (default 0.15).
-    val_size : float
-        Fraction of training data reserved for validation (default 0.15).
-    random_seed : int
-        Random seed for reproducibility (default 42).
+    smiles_col, target_col : column names in the CSV.
+    test_size : fraction of ALL data used for the test set.
+    val_size : fraction of the *remaining* (train+val) data used for validation.
+    random_seed : reproducibility seed.
+    split_method : ``"scaffold"`` (default) or ``"random"``.
     """
 
     def __init__(
@@ -50,243 +61,146 @@ class DataPreprocessor:
         test_size: float = 0.15,
         val_size: float = 0.15,
         random_seed: int = 42,
+        split_method: str = "scaffold",
     ) -> None:
-        self.smiles_col  = smiles_col
-        self.target_col  = target_col
-        self.test_size   = test_size
-        self.val_size    = val_size
+        if split_method not in ("scaffold", "random"):
+            raise ValueError("split_method must be 'scaffold' or 'random'")
+        self.smiles_col = smiles_col
+        self.target_col = target_col
+        self.test_size = test_size
+        self.val_size = val_size
         self.random_seed = random_seed
+        self.split_method = split_method
 
-        # Fitted during preprocessing; used later for inverse-transform
         self.target_scaler = StandardScaler()
-        self._is_fitted    = False
+        self._is_fitted = False
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ──────────────────────────────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------ load
     def load(self, path: str | Path) -> pd.DataFrame:
-        """
-        Load a CSV dataset and return a raw DataFrame.
-
-        Parameters
-        ----------
-        path : str or Path
-            File path to the CSV dataset.
-
-        Returns
-        -------
-        pd.DataFrame
-            Raw DataFrame with at minimum `smiles_col` and `target_col`.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the file does not exist.
-        ValueError
-            If required columns are missing.
-        """
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Dataset not found: {path}")
-
         df = pd.read_csv(path)
         logger.info("Loaded %d rows from %s", len(df), path)
-
-        # Validate required columns
-        for col in [self.smiles_col, self.target_col]:
+        for col in (self.smiles_col, self.target_col):
             if col not in df.columns:
-                raise ValueError(
-                    f"Column '{col}' not found. Available: {list(df.columns)}"
-                )
-
+                raise ValueError(f"Column '{col}' not found. Available: {list(df.columns)}")
         return df
 
+    # ----------------------------------------------------------------- clean
     def clean(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Clean the dataset by:
-          1. Removing rows with missing SMILES or target values.
-          2. Validating SMILES strings via RDKit.
-          3. Canonicalizing valid SMILES.
-          4. Removing duplicate molecules (by canonical SMILES).
-          5. Removing rows with non-numeric target values.
-
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Raw DataFrame from :meth:`load`.
-
-        Returns
-        -------
-        pd.DataFrame
-            Cleaned DataFrame with a new ``canonical_smiles`` column.
-        """
+        """Drop missing/invalid rows, canonicalise SMILES, remove duplicates."""
         n_raw = len(df)
         df = df.copy()
 
-        # ── Step 1: Drop missing values ───────────────────────────────────────
-        df.dropna(subset=[self.smiles_col, self.target_col], inplace=True)
+        df = df.dropna(subset=[self.smiles_col, self.target_col])
+        df[self.target_col] = _to_numeric(df[self.target_col])
+        df = df.dropna(subset=[self.target_col])
+        n_after_missing = len(df)
 
-        # ── Step 2: Coerce target to numeric ──────────────────────────────────
-        df[self.target_col] = pd.to_numeric(df[self.target_col], errors="coerce")
-        df.dropna(subset=[self.target_col], inplace=True)
-
-        # ── Step 3: Validate & canonicalize SMILES ────────────────────────────
-        canonical = []
-        valid_idx = []
+        canonical, keep = [], []
         for idx, smi in df[self.smiles_col].items():
-            mol = Chem.MolFromSmiles(str(smi))
-            if mol is not None:
-                canonical.append(Chem.MolToSmiles(mol))   # canonical form
-                valid_idx.append(idx)
-            else:
-                logger.debug("Invalid SMILES skipped: %s", smi)
-
-        df = df.loc[valid_idx].copy()
+            mol = Chem.MolFromSmiles(str(smi).strip())
+            if mol is None:
+                logger.warning("Invalid SMILES skipped: %r", smi)
+                continue
+            canonical.append(Chem.MolToSmiles(mol))
+            keep.append(idx)
+        df = df.loc[keep].copy()
         df["canonical_smiles"] = canonical
+        n_valid = len(df)
 
-        # ── Step 4: Remove duplicates ─────────────────────────────────────────
-        n_before_dedup = len(df)
-        df.drop_duplicates(subset=["canonical_smiles"], keep="first", inplace=True)
+        df = df.drop_duplicates(subset=["canonical_smiles"], keep="first")
 
         logger.info(
-            "Cleaning: %d → %d rows  "
-            "(dropped %d invalid SMILES, %d duplicates)",
-            n_raw,
-            len(df),
-            n_raw - n_before_dedup,
-            n_before_dedup - len(df),
+            "Cleaning: %d -> %d rows (missing/non-numeric: %d, invalid SMILES: %d, duplicates: %d)",
+            n_raw, len(df), n_raw - n_after_missing, n_after_missing - n_valid, n_valid - len(df),
         )
         return df.reset_index(drop=True)
 
-    def split(
-        self, df: pd.DataFrame
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Split cleaned data into train / validation / test sets.
+    # ----------------------------------------------------------------- split
+    def split(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        if "canonical_smiles" not in df.columns:
+            raise ValueError("Run clean() first: 'canonical_smiles' column missing.")
+        if len(df) < 10:
+            raise ValueError(f"Need at least 10 molecules to split, got {len(df)}.")
 
-        The split preserves the approximate distribution of the target
-        property by binning values into deciles for stratification.
+        if self.split_method == "scaffold":
+            train, val, test = self._scaffold_split(df)
+        else:
+            train, val, test = self._random_split(df)
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Cleaned DataFrame from :meth:`clean`.
+        logger.info("Split (%s) -> train: %d | val: %d | test: %d",
+                    self.split_method, len(train), len(val), len(test))
+        return (train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True))
 
-        Returns
-        -------
-        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
-            (train_df, val_df, test_df)
-        """
-        # Create decile bins for stratified splitting
-        y = df[self.target_col].values
-        bins = pd.qcut(y, q=10, labels=False, duplicates="drop")
+    def _scaffold_split(self, df: pd.DataFrame):
+        groups: dict[str, List[int]] = defaultdict(list)
+        for i, smi in enumerate(df["canonical_smiles"]):
+            groups[murcko_scaffold(smi)].append(i)
 
-        train_val, test = train_test_split(
-            df,
-            test_size=self.test_size,
-            stratify=bins,
-            random_state=self.random_seed,
-        )
+        # Largest scaffold groups first -> they go to train; rare scaffolds
+        # end up in val/test. Ties are broken deterministically with the seed.
+        rng = np.random.RandomState(self.random_seed)
+        sets = list(groups.values())
+        rng.shuffle(sets)
+        sets.sort(key=len, reverse=True)
 
-        # Recompute bins for the remaining train+val data
-        y_tv  = train_val[self.target_col].values
-        bins_tv = pd.qcut(y_tv, q=10, labels=False, duplicates="drop")
+        n = len(df)
+        n_test = max(1, int(round(self.test_size * n)))
+        n_val = max(1, int(round(self.val_size * (n - n_test))))
+        n_train_target = n - n_test - n_val
 
-        train, val = train_test_split(
-            train_val,
-            test_size=self.val_size,
-            stratify=bins_tv,
-            random_state=self.random_seed,
-        )
+        train_idx, val_idx, test_idx = [], [], []
+        for s in sets:
+            if len(train_idx) + len(s) <= n_train_target:
+                train_idx += s
+            elif len(val_idx) + len(s) <= n_val:
+                val_idx += s
+            else:
+                test_idx += s
+        if not val_idx or not test_idx or not train_idx:
+            raise ValueError(
+                "Scaffold split produced an empty subset (too few distinct scaffolds); "
+                "use split_method='random' or more data."
+            )
+        return df.iloc[train_idx], df.iloc[val_idx], df.iloc[test_idx]
 
-        logger.info(
-            "Split → train: %d | val: %d | test: %d",
-            len(train),
-            len(val),
-            len(test),
-        )
-        return (
-            train.reset_index(drop=True),
-            val.reset_index(drop=True),
-            test.reset_index(drop=True),
-        )
+    def _random_split(self, df: pd.DataFrame):
+        def stratified_split(frame: pd.DataFrame, test_size: float):
+            n_test = int(np.ceil(test_size * len(frame))) if test_size < 1 else int(test_size)
+            # Stratify on target quantiles only when every bin can be represented.
+            for q in (10, 5, 3, 2):
+                bins = pd.qcut(frame[self.target_col].values, q=q, labels=False, duplicates="drop")
+                counts = np.bincount(bins)
+                if n_test >= len(counts) and (len(frame) - n_test) >= len(counts) and counts.min() >= 2:
+                    return train_test_split(frame, test_size=test_size,
+                                            stratify=bins, random_state=self.random_seed)
+            return train_test_split(frame, test_size=test_size, random_state=self.random_seed)
 
+        train_val, test = stratified_split(df, self.test_size)
+        train, val = stratified_split(train_val, self.val_size)
+        return train, val, test
+
+    # ------------------------------------------------------- target scaling
     def normalize_targets(
-        self,
-        train_df: pd.DataFrame,
-        val_df: pd.DataFrame,
-        test_df: pd.DataFrame,
+        self, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Fit a StandardScaler on training targets and transform all splits.
-
-        The scaler is stored as ``self.target_scaler`` for inverse-transform
-        during evaluation.
-
-        Parameters
-        ----------
-        train_df, val_df, test_df : pd.DataFrame
-            Split DataFrames from :meth:`split`.
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray, np.ndarray]
-            (y_train, y_val, y_test) — normalized target arrays.
-        """
-        y_train = train_df[self.target_col].values.reshape(-1, 1)
-        y_val   = val_df[self.target_col].values.reshape(-1, 1)
-        y_test  = test_df[self.target_col].values.reshape(-1, 1)
-
-        # Fit only on training data to avoid data leakage
-        y_train_norm = self.target_scaler.fit_transform(y_train).ravel()
-        y_val_norm   = self.target_scaler.transform(y_val).ravel()
-        y_test_norm  = self.target_scaler.transform(y_test).ravel()
-
+        """Fit the scaler on TRAIN targets only and transform all splits."""
+        col = self.target_col
+        y_train = self.target_scaler.fit_transform(train_df[[col]].values).ravel()
+        y_val = self.target_scaler.transform(val_df[[col]].values).ravel()
+        y_test = self.target_scaler.transform(test_df[[col]].values).ravel()
         self._is_fitted = True
-        logger.info(
-            "Target normalization: mean=%.4f, std=%.4f",
-            self.target_scaler.mean_[0],
-            self.target_scaler.scale_[0],
-        )
-        return y_train_norm, y_val_norm, y_test_norm
+        logger.info("Target normalisation: mean=%.4f std=%.4f",
+                    self.target_scaler.mean_[0], self.target_scaler.scale_[0])
+        return y_train, y_val, y_test
 
     def inverse_transform_targets(self, y_norm: np.ndarray) -> np.ndarray:
-        """
-        Inverse-transform normalized predictions back to original scale.
-
-        Parameters
-        ----------
-        y_norm : np.ndarray
-            Normalized prediction array.
-
-        Returns
-        -------
-        np.ndarray
-            Predictions in original (un-normalized) scale.
-        """
         if not self._is_fitted:
             raise RuntimeError("Call normalize_targets() before inverse_transform.")
-        return self.target_scaler.inverse_transform(
-            y_norm.reshape(-1, 1)
-        ).ravel()
+        return self.target_scaler.inverse_transform(np.asarray(y_norm).reshape(-1, 1)).ravel()
 
-    def run(
-        self, path: str | Path
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Full preprocessing pipeline: load → clean → split.
-
-        Parameters
-        ----------
-        path : str or Path
-            Path to the input CSV file.
-
-        Returns
-        -------
-        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
-            (train_df, val_df, test_df)
-        """
-        df = self.load(path)
-        df = self.clean(df)
-        return self.split(df)
+    def run(self, path: str | Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """load -> clean -> split."""
+        return self.split(self.clean(self.load(path)))

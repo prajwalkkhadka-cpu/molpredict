@@ -1,37 +1,44 @@
 """
-Feature Engineering Module
-==========================
-Extracts molecular representations from SMILES strings using RDKit:
-  1. Morgan Fingerprints (ECFP / circular fingerprints)
-  2. Physical-chemical molecular descriptors (MW, LogP, TPSA, HBD, HBA, etc.)
-  3. Feature normalization and combination
+Feature engineering: Morgan fingerprints + a few 2D physicochemical descriptors.
+
+Note: Crippen ``MolLogP`` is deliberately NOT used as an input descriptor. The
+prediction target is LogP, so feeding an RDKit LogP estimate to the model would
+let it mostly copy that estimate, and it would make the "model vs RDKit
+baseline" comparison meaningless.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import pandas as pd
-from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors
-from sklearn.preprocessing import StandardScaler
+from rdkit import Chem, DataStructs
+from rdkit.Chem import Descriptors, rdFingerprintGenerator
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DESCRIPTORS = [
+    "MolWt",
+    "NumHDonors",
+    "NumHAcceptors",
+    "TPSA",
+    "NumRotatableBonds",
+    "NumAromaticRings",
+    "FractionCSP3",
+    "RingCount",
+]
 
 
 class FeatureEngineer:
     """
-    Computes Morgan fingerprints and 2D molecular descriptors.
-
     Parameters
     ----------
-    radius : int
-        Morgan fingerprint radius (2 = ECFP4, 3 = ECFP6). Default is 2.
-    n_bits : int
-        Bit vector size for Morgan fingerprints. Default is 2048.
-    use_descriptors : bool
-        Whether to calculate 2D physicochemical descriptors. Default is True.
-    normalize_descriptors : bool
-        Whether to scale descriptors using StandardScaler. Default is True.
+    radius : Morgan radius (2 = ECFP4).
+    n_bits : fingerprint length.
+    use_descriptors : append 2D descriptors to the fingerprint.
+    normalize_descriptors : z-score descriptors (scaler fitted on TRAIN only).
+    descriptor_names : RDKit ``Descriptors`` function names to compute.
     """
 
     def __init__(
@@ -40,104 +47,119 @@ class FeatureEngineer:
         n_bits: int = 2048,
         use_descriptors: bool = True,
         normalize_descriptors: bool = True,
+        descriptor_names: Optional[List[str]] = None,
     ) -> None:
         self.radius = radius
         self.n_bits = n_bits
         self.use_descriptors = use_descriptors
         self.normalize_descriptors = normalize_descriptors
-        self.descriptor_scaler = StandardScaler()
-        self._is_scaler_fitted = False
+        self.descriptor_names = list(descriptor_names or DEFAULT_DESCRIPTORS)
 
-        # Selected stable 2D descriptors
-        self.descriptor_names = [
-            "MolWt",
-            "MolLogP",
-            "NumHDonors",
-            "NumHAcceptors",
-            "TPSA",
-            "NumRotatableBonds",
-            "NumAromaticRings",
-            "FractionCSP3",
-            "RingCount",
-        ]
+        for name in self.descriptor_names:
+            if not hasattr(Descriptors, name):
+                raise ValueError(f"Unknown RDKit descriptor: {name}")
 
-    def smiles_to_morgan_fingerprint(self, smiles: str) -> Optional[np.ndarray]:
-        """Convert a SMILES string to Morgan fingerprint bit vector."""
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=self.radius, nBits=self.n_bits)
+        self._fp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+        self._desc_mean: Optional[np.ndarray] = None
+        self._desc_scale: Optional[np.ndarray] = None
+
+    # ----------------------------------------------------------- properties
+    @property
+    def is_scaler_fitted(self) -> bool:
+        return self._desc_mean is not None
+
+    @property
+    def feature_dim(self) -> int:
+        return self.n_bits + (len(self.descriptor_names) if self.use_descriptors else 0)
+
+    # --------------------------------------------------------- single mol
+    def mol_to_fingerprint(self, mol: Chem.Mol) -> np.ndarray:
+        fp = self._fp_gen.GetFingerprint(mol)
         arr = np.zeros((self.n_bits,), dtype=np.float32)
-        AllChem.DataStructs.ConvertToNumpyArray(fp, arr)
+        DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
 
-    def compute_descriptors(self, smiles: str) -> Optional[np.ndarray]:
-        """Calculate specified 2D chemical descriptors for a molecule."""
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
+    def mol_to_descriptors(self, mol: Chem.Mol) -> np.ndarray:
         values = []
         for name in self.descriptor_names:
-            func = getattr(Descriptors, name, None)
-            if func is not None:
-                try:
-                    val = float(func(mol))
-                except Exception:
-                    val = 0.0
-            else:
+            try:
+                val = float(getattr(Descriptors, name)(mol))
+            except Exception:
                 val = 0.0
-            values.append(val)
+            values.append(val if np.isfinite(val) else 0.0)
         return np.array(values, dtype=np.float32)
 
+    def smiles_to_morgan_fingerprint(self, smiles: str) -> Optional[np.ndarray]:
+        mol = Chem.MolFromSmiles(smiles)
+        return None if mol is None else self.mol_to_fingerprint(mol)
+
+    def compute_descriptors(self, smiles: str) -> Optional[np.ndarray]:
+        mol = Chem.MolFromSmiles(smiles)
+        return None if mol is None else self.mol_to_descriptors(mol)
+
+    # -------------------------------------------------------------- batch
     def extract_features(
-        self,
-        smiles_list: List[str],
-        fit_scaler: bool = False,
+        self, smiles_list: List[str], fit_scaler: bool = False
     ) -> Tuple[np.ndarray, List[int]]:
         """
-        Extract fingerprint and descriptor features for a list of SMILES.
-
-        Parameters
-        ----------
-        smiles_list : list of str
-            List of valid canonical SMILES.
-        fit_scaler : bool
-            Fit the descriptor scaler (set True for train split only).
-
-        Returns
-        -------
-        Tuple[np.ndarray, list of int]
-            Combined feature matrix and indices of successfully parsed molecules.
+        Returns ``(X, valid_indices)``. ``valid_indices`` are positions in
+        ``smiles_list`` that parsed successfully; ``X`` has one row per index.
         """
-        fps = []
-        descs = []
-        valid_indices = []
-
+        fps, descs, valid = [], [], []
         for idx, smi in enumerate(smiles_list):
-            fp = self.smiles_to_morgan_fingerprint(smi)
-            if fp is None:
+            mol = Chem.MolFromSmiles(smi) if isinstance(smi, str) else None
+            if mol is None:
                 continue
-
-            fps.append(fp)
-            valid_indices.append(idx)
-
+            fps.append(self.mol_to_fingerprint(mol))
             if self.use_descriptors:
-                desc = self.compute_descriptors(smi)
-                descs.append(desc if desc is not None else np.zeros(len(self.descriptor_names), dtype=np.float32))
+                descs.append(self.mol_to_descriptors(mol))
+            valid.append(idx)
 
-        X_fp = np.array(fps, dtype=np.float32)
+        if not valid:
+            return np.zeros((0, self.feature_dim), dtype=np.float32), []
 
+        X_fp = np.stack(fps).astype(np.float32)
         if not self.use_descriptors:
-            return X_fp, valid_indices
+            return X_fp, valid
 
-        X_desc = np.array(descs, dtype=np.float32)
-
+        X_desc = np.stack(descs).astype(np.float32)
         if self.normalize_descriptors:
             if fit_scaler:
-                X_desc = self.descriptor_scaler.fit_transform(X_desc)
-                self._is_scaler_fitted = True
-            elif self._is_scaler_fitted:
-                X_desc = self.descriptor_scaler.transform(X_desc)
+                self._desc_mean = X_desc.mean(axis=0)
+                std = X_desc.std(axis=0)
+                self._desc_scale = np.where(std < 1e-8, 1.0, std)
+            elif not self.is_scaler_fitted:
+                raise RuntimeError(
+                    "Descriptor scaler is not fitted. Call extract_features(..., "
+                    "fit_scaler=True) on the training split first (or load_state())."
+                )
+            X_desc = (X_desc - self._desc_mean) / self._desc_scale
 
-        X_combined = np.hstack([X_fp, X_desc])
-        return X_combined, valid_indices
+        return np.hstack([X_fp, X_desc]).astype(np.float32), valid
+
+    # ------------------------------------------------------- persistence
+    def get_state(self) -> Dict:
+        """JSON/tensor-free state needed to reproduce features at inference."""
+        return {
+            "radius": self.radius,
+            "n_bits": self.n_bits,
+            "use_descriptors": self.use_descriptors,
+            "normalize_descriptors": self.normalize_descriptors,
+            "descriptor_names": self.descriptor_names,
+            "desc_mean": None if self._desc_mean is None else self._desc_mean.tolist(),
+            "desc_scale": None if self._desc_scale is None else self._desc_scale.tolist(),
+        }
+
+    @classmethod
+    def from_state(cls, state: Dict) -> "FeatureEngineer":
+        eng = cls(
+            radius=state["radius"],
+            n_bits=state["n_bits"],
+            use_descriptors=state["use_descriptors"],
+            normalize_descriptors=state["normalize_descriptors"],
+            descriptor_names=state["descriptor_names"],
+        )
+        if state.get("desc_mean") is not None:
+            eng._desc_mean = np.asarray(state["desc_mean"], dtype=np.float32)
+            eng._desc_scale = np.asarray(state["desc_scale"], dtype=np.float32)
+        return eng

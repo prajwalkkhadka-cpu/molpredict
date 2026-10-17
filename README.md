@@ -1,137 +1,62 @@
-# 🧬 MolPredict: Deep Learning Molecular Property Prediction
+# MolPredict
 
-A modular, production-grade Python & PyTorch deep learning framework for predicting molecular properties (LogP, Lipophilicity, Drug-Likeness) from chemical SMILES strings.
+Predict molecular **LogP** (lipophilicity) from a SMILES string.
+Pipeline: SMILES -> RDKit features (Morgan fingerprint + 8 descriptors) -> PyTorch MLP.
 
-![Python](https://img.shields.io/badge/Python-3.9+-3776AB.svg?logo=python&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C.svg?logo=pytorch&logoColor=white)
-![RDKit](https://img.shields.io/badge/RDKit-Cheminformatics-23D96C.svg)
-![License](https://img.shields.io/badge/License-MIT-blue.svg)
+> **Status: prototype.** The code is a working, tested end-to-end pipeline, but the bundled
+> dataset has only 50 molecules, so the numbers below are illustrative, not a benchmark.
 
----
-
-## ⚡ Quickstart — Run the Interactive App Instantly!
-
-No heavy setup required! Clone and run the colorful interactive terminal interface right away:
-
-```bash
-# 1. Clone repository
-git clone https://github.com/prajwalkkhadka-cpu/molpredict.git
-cd molpredict
-
-# 2. Run the interactive terminal demo
-python demo.py
-```
-
-### 🎯 Or Run Instant One-Line Predictions:
-
-```bash
-# Predict by drug name
-python predict.py --name aspirin
-python predict.py --name caffeine
-
-# Predict by custom chemical SMILES
-python predict.py --smiles "CC(=O)Oc1ccccc1C(=O)O"
-```
-
----
-
-## 🖥️ Live Terminal Demo Preview
-
-```
-  ╔════════════════════════════════════════════════════════════════╗
-  ║                                                                ║
-  ║      🧬  MOLPREDICT : DEEP LEARNING MOLECULAR ENGINE  🧬       ║
-  ║            Built with PyTorch • by prajwalkkhadka-cpu          ║
-  ║                                                                ║
-  ╚════════════════════════════════════════════════════════════════╝
-
-  ── Processing Molecule: Aspirin
-  SMILES String : CC(=O)Oc1ccccc1C(=O)O
-
-  ┌──────────────────────────────────────────────────────────┐
-  │ 📊 DEEP LEARNING PREDICTION REPORT                       │
-  ├──────────────────────────────────────────────────────────┤
-  │  • Predicted LogP (Octanol/Water) :   1.19               │
-  │  • Experimental Known LogP        :   1.19               │
-  │  • Absolute Prediction Error (MAE):   0.00               │
-  │  • Estimated Molecular Weight     :  180.2 g/mol         │
-  │  • Topological Polar Surface Area :   63.6 Å²            │
-  │  • Rotatable Bonds Count          :      3               │
-  └──────────────────────────────────────────────────────────┘
-
-  💊 Lipinski's Rule of 5 (Drug-Likeness Assessment):
-     ✅ PASS | Molecular Weight <= 500 Da     (Value: 180.2 Da)
-     ✅ PASS | LogP (Lipophilicity) <= 5.0     (Value: 1.19)
-     ✅ PASS | H-Bond Donors <= 5             (Value: 1)
-     ✅ PASS | H-Bond Acceptors <= 10         (Value: 4)
-
-  🎉 Excellent Drug-likeness! (0 violations of Rule of 5)
-```
-
----
-
-## 🏗️ Architecture & Modules
-
-1. **`demo.py` & `predict.py`**:
-   - Interactive terminal UI and CLI tool with real-time inference and Lipinski's Rule of 5 evaluation.
-2. **`molpredict/data/preprocessing.py`**:
-   - SMILES canonicalization, cleaning, and stratified train/validation/test splitting.
-3. **`molpredict/features/engineering.py`**:
-   - Circular Morgan Fingerprints (ECFP4 / 2048-bit bit-vectors) and 2D physicochemical descriptors.
-4. **`molpredict/models/mlp.py`**:
-   - Deep Multi-Layer Perceptron in PyTorch with Dropout, BatchNorm, and GELU activation.
-5. **`molpredict/training/trainer.py`**:
-   - AdamW optimizer, Cosine Annealing learning rate schedule, early stopping, and checkpointing.
-6. **`molpredict/evaluation/metrics.py`**:
-   - RMSE, MAE, Coefficient of Determination ($R^2$), and Pearson Correlation ($r$).
-
----
-
-## 📁 Repository Structure
-
-```
-molpredict/
-├── demo.py                       # 🚀 Interactive terminal application
-├── predict.py                    # ⚡ One-liner CLI prediction tool
-├── config/
-│   └── config.yaml               # Model configuration & hyperparameters
-├── data/
-│   └── sample_data.csv           # Benchmark molecular dataset
-├── molpredict/
-│   ├── data/                     # Preprocessing & PyTorch dataset loader
-│   ├── features/                 # Morgan fingerprints & RDKit descriptors
-│   ├── models/                   # Deep Neural Network architecture
-│   ├── training/                 # Optimization loop with early stopping
-│   └── evaluation/               # Statistical regression metrics
-├── scripts/
-│   └── train.py                  # Full model training script
-├── tests/
-│   └── test_pipeline.py          # Pytest unit test suite
-├── requirements.txt
-├── setup.py
-└── README.md
-```
-
----
-
-## 🧪 Full Model Training
-
-To retrain the neural network on custom datasets:
+## Quickstart
 
 ```bash
 pip install -r requirements.txt
-python scripts/train.py --config config/config.yaml
+pip install -e .                      # optional: installs `molpredict-train` / `molpredict-predict`
+
+python scripts/train.py               # trains and writes checkpoints/best_model.pt + metrics.json
+python predict.py --name aspirin
+python predict.py --smiles "CC(=O)Oc1ccccc1C(=O)O"
+python demo.py                        # interactive menu
+python -m pytest -q                   # 27 tests
 ```
 
----
+Without a trained checkpoint, `predict.py` and `demo.py` say so and show RDKit-computed values
+only (labelled "RDKit Crippen estimate"). They never fake a model prediction. Invalid SMILES are rejected.
 
-## 👤 Author
+## What each part does
 
-**Prajwal Khadka** ([@prajwalkkhadka-cpu](https://github.com/prajwalkkhadka-cpu))  
-*B.Tech ECE (1st Year) | Python-First Developer*
+| Path | Purpose |
+|---|---|
+| `molpredict/data/preprocessing.py` | load, clean (invalid/duplicate/unicode-minus handling), **scaffold** or random split, target scaling |
+| `molpredict/features/engineering.py` | Morgan fingerprints + descriptors; scaler fitted on train only; state is saved for inference |
+| `molpredict/models/mlp.py` | feed-forward regressor (Linear, BatchNorm, activation, Dropout) |
+| `molpredict/training/trainer.py` | AdamW, warm-up + cosine LR, grad clipping, early stopping, restores best weights |
+| `molpredict/pipeline.py` | full training run, plus baselines evaluated on the same test molecules |
+| `molpredict/inference.py` | `Predictor.from_checkpoint(...)`: reproduces training featurisation and target scaling |
+| `molpredict/chem.py` | RDKit properties and Lipinski rule of five (real values) |
+| `config/config.yaml` | every key is read by the pipeline |
 
----
+## Example run on the bundled data
 
-## 📄 License
+Scaffold split, 36 train / 6 val / 7 test molecules, seed 42:
 
-MIT License — feel free to explore, fork, and build upon it!
+| Model (test set, n=7) | RMSE | R^2 |
+|---|---|---|
+| Predict train mean | 1.84 | -0.30 |
+| Ridge on same features | 1.40 | 0.25 |
+| **MLP (this repo)** | **1.03** | **0.60** |
+| RDKit Crippen LogP (no training) | 0.88 | 0.70 |
+
+With 7 test molecules these differences are well within noise (validation R^2 was negative).
+RDKit's own Crippen estimate is the baseline to beat; to get a meaningful result, train on a real
+dataset such as MoleculeNet ESOL or Lipophilicity (set `data.path` / `target_col` in the config).
+
+## Known limitations
+
+* **Dataset:** `data/sample_data.csv` is tiny. Its `logP` labels are unverified, and a few look
+  questionable (e.g. salicylic acid is listed at 1.19, the same as aspirin). Verify against a
+  reference source before drawing conclusions. `mol_weight` and `tpsa` columns were recomputed with
+  RDKit (the originals disagreed with the SMILES); the pipeline does not use them.
+* The demo's "reference" LogP for preset drugs comes from the same small set the model trains on,
+  so those errors are not a fair test.
+* Crippen `MolLogP` is intentionally **not** an input feature (it would leak the target).
+* Single-task regression only; no GNN is implemented.

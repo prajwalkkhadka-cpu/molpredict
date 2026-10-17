@@ -1,76 +1,44 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# MolPredict Configuration
-# ──────────────────────────────────────────────────────────────────────────────
+# MolPredict configuration. Every key below is read by molpredict/pipeline.py.
 
-# ── Data Settings ─────────────────────────────────────────────────────────────
 data:
-  path: "data/sample_data.csv"          # Path to input CSV file
-  smiles_col: "smiles"                  # Column name containing SMILES strings
-  target_col: "logP"                    # Target property column to predict
-  test_size: 0.15                       # Fraction of data for test set
-  val_size: 0.15                        # Fraction of training data for validation
-  random_seed: 42                       # Reproducibility seed
+  path: "data/sample_data.csv"
+  smiles_col: "smiles"
+  target_col: "logP"
+  test_size: 0.15          # fraction of ALL data
+  val_size: 0.15           # fraction of the remaining train+val data
+  random_seed: 42
+  split_method: "scaffold" # "scaffold" (recommended) or "random"
 
-# ── Feature Engineering ───────────────────────────────────────────────────────
 features:
   fingerprint:
-    radius: 2                           # Morgan fingerprint radius (ECFP4)
-    n_bits: 2048                        # Fingerprint bit vector length
-    use_chirality: true                 # Include chirality information
-    use_features: true                  # Use feature-based fingerprints
+    radius: 2              # 2 = ECFP4
+    n_bits: 2048
   descriptors:
-    enabled: true                       # Include RDKit molecular descriptors
-    normalize: true                     # Normalize descriptors to [0,1]
-  pca:
-    enabled: false                      # Apply PCA for dimensionality reduction
-    n_components: 512                   # Number of PCA components
+    enabled: true
+    normalize: true        # z-score, fitted on the training split only
+    # names: [MolWt, TPSA]   # optional override of the default descriptor list
 
-# ── Model Settings ────────────────────────────────────────────────────────────
 model:
-  type: "mlp"                           # Options: "mlp", "gnn"
-
   mlp:
-    hidden_dims: [1024, 512, 256, 128]  # Hidden layer dimensions
-    dropout: 0.3                        # Dropout probability
-    batch_norm: true                    # Use batch normalization
-    activation: "relu"                  # Activation function: relu, gelu, silu
+    hidden_dims: [512, 128]
+    dropout: 0.3
+    batch_norm: true
+    activation: "relu"     # relu | gelu | silu
 
-  gnn:
-    hidden_dim: 128                     # GNN hidden dimension
-    num_layers: 4                       # Number of message-passing layers
-    dropout: 0.3                        # Dropout probability
-    pooling: "mean"                     # Graph pooling: mean, sum, max
-
-# ── Training Settings ─────────────────────────────────────────────────────────
 training:
-  epochs: 100                           # Maximum training epochs
-  batch_size: 64                        # Batch size
-  learning_rate: 0.001                  # Initial learning rate
-  weight_decay: 1.0e-5                  # L2 regularization
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.001
+  weight_decay: 1.0e-5
+  gradient_clip: 1.0
   scheduler:
-    type: "cosine"                      # LR scheduler: cosine, step, plateau
-    warmup_epochs: 5                    # Linear warmup epochs
-    min_lr: 1.0e-6                      # Minimum learning rate
+    warmup_epochs: 5       # linear warm-up, then cosine decay
+    min_lr: 1.0e-6
   early_stopping:
-    enabled: true                       # Enable early stopping
-    patience: 15                        # Epochs without improvement before stop
-    min_delta: 0.0001                   # Minimum improvement threshold
-  gradient_clip: 1.0                    # Gradient clipping max norm
-  device: "auto"                        # Device: auto, cpu, cuda, mps
+    enabled: true
+    patience: 15
+    min_delta: 0.0001
+  device: "auto"           # auto | cpu | cuda | mps
 
-# ── Checkpointing ─────────────────────────────────────────────────────────────
 checkpoint:
-  dir: "checkpoints/"                   # Directory to save model checkpoints
-  save_best: true                       # Save best model by validation loss
-  save_last: true                       # Save last epoch checkpoint
-  metric: "val_rmse"                    # Metric for best model selection
-
-# ── Evaluation ────────────────────────────────────────────────────────────────
-evaluation:
-  metrics: ["rmse", "mae", "r2", "pearson"]  # Metrics to compute
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging:
-  level: "INFO"                         # Logging level: DEBUG, INFO, WARNING
-  log_dir: "logs/"                      # Directory for log files
-  log_interval: 10                      # Log every N batches
+  dir: "checkpoints/"
